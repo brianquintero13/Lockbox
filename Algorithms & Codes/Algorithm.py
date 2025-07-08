@@ -1,18 +1,106 @@
-import RPi.GPIO as GPIO
+"""
+Secure Lockbox System for Raspberry Pi
+Requires the following hardware libraries:
+- RPi.GPIO (sudo apt-get install python3-rpi.gpio)
+- adafruit-circuitpython-mcp230xx (pip install adafruit-circuitpython-mcp230xx)
+- adafruit-blinka (pip install adafruit-blinka)
+"""
+
 import time
 import json
 import hashlib
 from datetime import datetime
 import threading
-import board
-import busio
-from adafruit_mcp230xx.mcp23017 import MCP23017
-import digitalio
+
+# Hardware-specific imports with error handling
+try:
+    import RPi.GPIO as GPIO
+    import board
+    import busio
+    from adafruit_mcp230xx.mcp23017 import MCP23017
+    import digitalio
+    HARDWARE_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Hardware libraries not available: {e}")
+    print("This code requires a Raspberry Pi with the following packages:")
+    print("- sudo apt-get install python3-rpi.gpio")
+    print("- pip install adafruit-circuitpython-mcp230xx")
+    print("- pip install adafruit-blinka")
+    HARDWARE_AVAILABLE = False
+    
+    # Mock GPIO for development/testing
+    class MockGPIO:
+        BCM = "BCM"
+        OUT = "OUT"
+        IN = "IN"
+        HIGH = True
+        LOW = False
+        PUD_UP = "PUD_UP"
+        
+        @staticmethod
+        def setmode(mode): pass
+        @staticmethod
+        def setwarnings(state): pass
+        @staticmethod
+        def setup(pin, mode, **kwargs): pass
+        @staticmethod
+        def output(pin, state): pass
+        @staticmethod
+        def input(pin): return False
+        @staticmethod
+        def PWM(pin, freq): return MockPWM()
+        @staticmethod
+        def cleanup(): pass
+    
+    class MockPWM:
+        def start(self, duty): pass
+        def ChangeDutyCycle(self, duty): pass
+        def stop(self): pass
+    
+    class MockPin:
+        def __init__(self):
+            self.value = True  # Default to not pressed (pull-up)
+            self.direction = None
+            self.pull = None
+    
+    class MockMCP23017:
+        def __init__(self, i2c, address):
+            self.address = address
+        
+        def get_pin(self, pin_number):
+            return MockPin()
+    
+    GPIO = MockGPIO()
+    # Mock hardware classes
+    MCP23017 = MockMCP23017
+    
+    class MockDigitalIO:
+        class Direction:
+            INPUT = "INPUT"
+            OUTPUT = "OUTPUT"
+        
+        class Pull:
+            UP = "UP"
+    
+    digitalio = MockDigitalIO()
+    
+    class MockBoard:
+        SCL = "SCL"
+        SDA = "SDA"
+    
+    class MockBusIO:
+        @staticmethod
+        def I2C(scl, sda):
+            return None
+    
+    board = MockBoard()
+    busio = MockBusIO()
 
 class SecureLockboxSystem:
     def __init__(self, config_file="/home/pi/lockbox_config.json"):
         """Initialize the secure lockbox system"""
         self.config_file = config_file
+        self.hardware_available = HARDWARE_AVAILABLE
         self.load_configuration()
         
         # Hardware pin assignments
@@ -50,18 +138,32 @@ class SecureLockboxSystem:
 
     def setup_gpio_expanders(self):
         """Initialize I2C GPIO expanders for buttons and LEDs"""
+        if not HARDWARE_AVAILABLE:
+            self.log_event("GPIO expanders not available - running in mock mode")
+            self.button_pins = [MockPin() for _ in range(31)]
+            self.led_pins = [MockPin() for _ in range(31)]
+            return
+            
         try:
             i2c = busio.I2C(board.SCL, board.SDA)
             
-            # Three MCP23017 chips for 48 total GPIO pins
-            self.mcp_buttons = MCP23017(i2c, address=0x20)  # 31 buttons
-            self.mcp_leds1 = MCP23017(i2c, address=0x21)    # LEDs 0-15
-            self.mcp_leds2 = MCP23017(i2c, address=0x22)    # LEDs 16-30
+            # Four MCP23017 chips for 64 total GPIO pins
+            self.mcp_buttons1 = MCP23017(i2c, address=0x20)  # Buttons 0-15
+            self.mcp_buttons2 = MCP23017(i2c, address=0x21)  # Buttons 16-30
+            self.mcp_leds1 = MCP23017(i2c, address=0x22)    # LEDs 0-15
+            self.mcp_leds2 = MCP23017(i2c, address=0x23)    # LEDs 16-30
             
             # Configure button pins (with pull-up resistors)
             self.button_pins = []
-            for i in range(16):  # First 16 buttons
-                pin = self.mcp_buttons.get_pin(i)
+            for i in range(16):  # All 16 pins on first MCP23017
+                pin = self.mcp_buttons1.get_pin(i)
+                pin.direction = digitalio.Direction.INPUT
+                pin.pull = digitalio.Pull.UP
+                self.button_pins.append(pin)
+            
+            # Add 15 more buttons from second MCP23017 for total of 31
+            for i in range(15):  # Pins 0-14 on second chip
+                pin = self.mcp_buttons2.get_pin(i)
                 pin.direction = digitalio.Direction.INPUT
                 pin.pull = digitalio.Pull.UP
                 self.button_pins.append(pin)
@@ -172,6 +274,10 @@ class SecureLockboxSystem:
 
     def audio_feedback(self, pattern="single"):
         """Provide audio feedback for user actions"""
+        if not self.hardware_available:
+            self.log_event(f"Audio feedback: {pattern} (mock mode)")
+            return
+            
         try:
             if pattern == "single":
                 GPIO.output(self.buzzer_pin, GPIO.HIGH)
@@ -263,6 +369,10 @@ class SecureLockboxSystem:
 
     def unlock_mechanism(self):
         """Control servo to unlock the mechanism"""
+        if not self.hardware_available:
+            self.log_event("Unlock mechanism triggered (mock mode)")
+            return
+            
         try:
             self.log_event("Initiating unlock sequence")
             servo = GPIO.PWM(self.servo_pin, 50)  # 50Hz for servo
@@ -323,4 +433,105 @@ class SecureLockboxSystem:
     def handle_pin_entry(self):
         """Handle PIN entry phase with enhanced security"""
         entered_pin = ""
-        self.log_event("PIN entry phase
+        pin_timeout = 30  # 30 seconds timeout for PIN entry
+        start_time = time.time()
+        
+        self.log_event("PIN entry phase initiated")
+        
+        while True:
+            # Check for timeout
+            if time.time() - start_time > pin_timeout:
+                self.log_event("PIN entry timeout")
+                self.audio_feedback("error")
+                return False
+            
+            # Scan for keypad input
+            key = self.scan_keypad()
+            
+            if key:
+                self.log_event(f"Key pressed: {key}")
+                entered_pin += key
+                
+                # Check if PIN is complete (assuming 4-digit PIN)
+                if len(entered_pin) == 4:
+                    if self.hash_pin(entered_pin) == self.correct_pin_hash:
+                        self.log_event("PIN verification successful")
+                        self.unlock_mechanism()
+                        return True
+                    elif self.hash_pin(entered_pin) == self.admin_pin_hash:
+                        self.log_event("Admin PIN verified")
+                        self.admin_mode()
+                        return True
+                    else:
+                        self.log_event("Invalid PIN entered")
+                        self.audio_feedback("error")
+                        self.failed_attempts += 1
+                        
+                        if self.failed_attempts >= self.max_attempts:
+                            self.initiate_lockout()
+                        
+                        return False
+                
+                # Reset start time on valid input
+                start_time = time.time()
+            
+            time.sleep(0.1)  # Small delay to prevent CPU overload
+    
+    def admin_mode(self):
+        """Handle admin mode operations"""
+        self.log_event("Admin mode activated")
+        self.audio_feedback("success")
+        
+        # Flash status LED to indicate admin mode
+        for _ in range(5):
+            GPIO.output(self.status_led_pin, GPIO.HIGH)
+            time.sleep(0.2)
+            GPIO.output(self.status_led_pin, GPIO.LOW)
+            time.sleep(0.2)
+        
+        # Admin operations can be implemented here
+        self.log_event("Admin mode operations completed")
+    
+    def main_loop(self):
+        """Main system loop"""
+        self.log_event("System started - waiting for input")
+        
+        try:
+            while True:
+                if not self.system_locked:
+                    # Check for tree button presses
+                    self.check_tree_buttons()
+                    
+                    # If tree sequence is complete, proceed to PIN entry
+                    if self.unlocked:
+                        if self.handle_pin_entry():
+                            # Reset after successful unlock
+                            time.sleep(5)  # Keep unlocked for 5 seconds
+                            self.reset_system()
+                        else:
+                            # Reset on failed PIN entry
+                            self.reset_system()
+                
+                time.sleep(0.1)  # Main loop delay
+                
+        except KeyboardInterrupt:
+            self.log_event("System shutdown requested")
+            self.cleanup()
+        except Exception as e:
+            self.log_event(f"System error: {e}")
+            self.cleanup()
+    
+    def cleanup(self):
+        """Clean up GPIO resources"""
+        self.log_event("Cleaning up system resources")
+        GPIO.cleanup()
+        self.log_event("System shutdown complete")
+
+# Main execution
+if __name__ == "__main__":
+    try:
+        lockbox = SecureLockboxSystem()
+        lockbox.main_loop()
+    except Exception as e:
+        print(f"Failed to initialize system: {e}")
+        GPIO.cleanup()
